@@ -137,6 +137,10 @@ class QdrantService:
                 "Collection '%s' created (dim=%d, COSINE, sparse=%s)",
                 collection_name, dimension, enable_sparse,
             )
+            if hasattr(self, "_dense_vector_collections"):
+                self._dense_vector_collections.pop(collection_name, None)
+            if hasattr(self, "_hybrid_supported_collections"):
+                self._hybrid_supported_collections.pop(collection_name, None)
 
         else:
             info = self.client.get_collection(collection_name)
@@ -227,6 +231,24 @@ class QdrantService:
         except Exception:
             return False
 
+    def collection_supports_hybrid(self, collection_name: str) -> bool:
+        """Check if the collection was configured with both named 'dense' and 'sparse' vectors."""
+        try:
+            if not hasattr(self, "_hybrid_supported_collections"):
+                self._hybrid_supported_collections = {}
+            if collection_name in self._hybrid_supported_collections:
+                return self._hybrid_supported_collections[collection_name]
+            info = self.client.get_collection(collection_name)
+            vectors_config = info.config.params.vectors
+            sparse_config = info.config.params.sparse_vectors
+            has_dense = isinstance(vectors_config, dict) and "dense" in vectors_config
+            has_sparse = isinstance(sparse_config, dict) and (settings.SPARSE_VECTOR_NAME in sparse_config or len(sparse_config) > 0)
+            is_hybrid = bool(has_dense and has_sparse)
+            self._hybrid_supported_collections[collection_name] = is_hybrid
+            return is_hybrid
+        except Exception:
+            return False
+
 
     def get_vector_store(self, collection_name: str, embeddings: Any) -> QdrantVectorStore:
         """Returns a LangChain QdrantVectorStore instance for querying an existing collection."""
@@ -299,7 +321,7 @@ class QdrantService:
                         query_vector=query_vector,
                         **query_kwargs,
                     )
-                except Exception as e:
+                except Exception as e: 
                     if ("Not existing vector name error" in str(e) or "vector name" in str(e).lower()) and "vector_name" in query_kwargs:
                         logger.warning("Vector name '%s' not found in collection '%s'. Retrying unnamed vector.", using_vector, collection_name)
                         query_kwargs.pop("vector_name", None)
@@ -350,6 +372,13 @@ class QdrantService:
             List of dicts with 'content', 'metadata', and 'score' keys.
         """
         try:
+            if not self.collection_supports_hybrid(collection_name):
+                logger.debug(
+                    "Collection '%s' does not have hybrid schema (named 'dense' and '%s' sparse). Using dense search.",
+                    collection_name, settings.SPARSE_VECTOR_NAME,
+                )
+                return self.search_by_vector(collection_name, dense_vector, limit, query_filter)
+
             # Prefetch a larger candidate pool from each index, then fuse down to `limit`
             prefetch_limit = limit * 3
 
@@ -539,4 +568,4 @@ class QdrantService:
         if conditions:
             return models.Filter(must=conditions)
 
-        return None
+        return None

@@ -10,11 +10,14 @@ fastembed                    # Qdrant BM25 sparse embeddings (offline, no API co
 
 # ── OpenAI & Environment ──────────────────────────────────────────────
 langchain-openai
+langchain-groq
+langchain-huggingface        # HuggingFace embeddings fallback
+einops                       # Required for nomic / transformer embedding architectures
 python-dotenv
 
 pydantic_settings
 langgraph
-tavily
+tavily-python
 redis
 
 # ── Observability & Evaluation ────────────────────────────────────────

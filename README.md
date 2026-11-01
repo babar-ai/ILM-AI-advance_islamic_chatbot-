@@ -16,7 +16,7 @@
 
 **A production-grade, multi-source Retrieval-Augmented Generation (RAG) platform grounded in the Qur'an, Hadith, Tafsir, and Scholarly Islamic Knowledge.**
 
-*Featuring a stateful 5-node LangGraph pipeline, 3-tier semantic caching, hybrid vector search with BM25, cross-encoder reranking, real-time SSE token streaming, persistent conversation memory via Redis, and full LangSmith observability — deployed on AWS with automated HTTPS.*
+*Featuring a stateful LangGraph pipeline with per-stage latency logging, 3-tier semantic caching, hybrid vector search with BM25, cross-encoder reranking, real-time SSE token streaming, persistent conversation memory via Redis, and full LangSmith observability — deployed on AWS with automated HTTPS.*
 
 🌐 **Live Demo:** [ilm-ai-amber.vercel.app](https://ilm-ai-amber.vercel.app)
 
@@ -28,7 +28,7 @@
 
 - [Engineering Highlights](#-engineering-highlights)
 - [System Architecture](#-system-architecture)
-- [The 5-Node LangGraph Pipeline](#-the-5-node-langgraph-pipeline)
+- [The LangGraph Pipeline](#-the-langgraph-pipeline)
 - [Knowledge Base & Islamic Data Sources](#-knowledge-base--islamic-data-sources)
 - [3-Tier Semantic Caching Engine](#-3-tier-semantic-caching-engine)
 - [Hybrid Vector Search](#-hybrid-vector-search)
@@ -52,7 +52,7 @@
 
 | Feature | Implementation |
 |:---|:---|
-| **5-Node Stateful Pipeline** | LangGraph `StateGraph` with `AsyncRedisSaver` checkpointer for persistent multi-turn history |
+| **Stateful LangGraph Pipeline** | LangGraph `StateGraph` with `AsyncRedisSaver` checkpointer, per-stage latency state, and timing logs |
 | **Hybrid Vector Search** | OpenAI dense embeddings + BM25 sparse vectors (FastEmbed) fused via Reciprocal Rank Fusion (RRF) |
 | **Cross-Encoder Reranking** | FlashRank offline CPU reranker — no GPU, no API cost — scores all candidates and keeps top-K per source |
 | **3-Tier Semantic Cache** | Redis exact match → Qdrant semantic vector cache → OpenAI LLM fallback; 97%+ latency reduction on hits |
@@ -87,12 +87,13 @@ flowchart TB
             Limiter["Rate Limiter (10 req/min)"]
         end
 
-        subgraph Pipeline ["LangGraph 5-Node Pipeline"]
+        subgraph Pipeline ["LangGraph Pipeline"]
             N0["① rewrite_query — GPT-4o-mini"]
-            N1["② classify_and_search — GPT-4o-mini + Tavily"]
-            N2["③ parallel_retrieve — Qdrant Hybrid Search"]
-            N3["④ rerank_documents — FlashRank CPU"]
-            N4["⑤ generate_response — GPT-4o + SSE Stream"]
+            N1["② embed_query — OpenAI"]
+            N2["③ classify_and_search — GPT-4o-mini + Tavily"]
+            N3["④ parallel_retrieve — Qdrant Hybrid Search"]
+            N4["⑤ rerank_documents — FlashRank CPU"]
+            N5["⑥ generate_response — GPT-4o + SSE Stream"]
         end
 
         subgraph CacheEngine ["3-Tier Classification Cache"]
@@ -122,26 +123,26 @@ flowchart TB
 
     UI -->|HTTPS POST /text_query/stream| Caddy
     Caddy --> API
-    API --> Limiter --> N0 --> N1 --> N2 --> N3 --> N4
-    N1 -->|Optional| Tavily
-    N1 --> L1 -.->|Miss| L2 -.->|Miss| L3 --> OpenAI
-    N2 --> QD1 & QD2 & QD3 & QD4
-    N4 -->|SSE Tokens| API -->|Stream| Caddy -->|Real-Time| UI
+    API --> Limiter --> N0 --> N1 --> N2 --> N3 --> N4 --> N5
+    N2 -->|Optional| Tavily
+    N2 --> L1 -.->|Miss| L2 -.->|Miss| L3 --> OpenAI
+    N3 --> QD1 & QD2 & QD3 & QD4
+    N5 -->|SSE Tokens| API -->|Stream| Caddy -->|Real-Time| UI
     API -.->|Traces| LangSmith
     Caddy -->|/langgraph/*| LGApi -.->|Visual Graph| LangSmith
-    N0 & N1 & N4 --> OpenAI
+    N0 & N1 & N2 & N5 --> OpenAI
     Redis -->|Checkpointer| N0
     Redis -->|Rate Limit| Limiter
 ```
 
 ---
 
-## 🔁 The 5-Node LangGraph Pipeline
+## 🔁 The LangGraph Pipeline
 
-Every user message passes through a deterministic, stateful pipeline compiled as a LangGraph `StateGraph` with a Redis checkpointer that persists conversation history across all turns.
+Every user message passes through a deterministic, stateful pipeline compiled as a LangGraph `StateGraph` with a Redis checkpointer that persists conversation history across all turns. Rewrite, embedding, classification, retrieval, reranking, and generation durations are recorded in graph state and logged in milliseconds.
 
 ```
-rewrite_query → classify_and_search → parallel_retrieve → rerank_documents → generate_response
+rewrite_query → embed_query → classify_and_search → parallel_retrieve → rerank_documents → generate_response
 ```
 
 ### Node ① — `rewrite_query`
@@ -157,7 +158,14 @@ Resolves ambiguous follow-up questions by reading the last N conversation turns 
 
 ---
 
-### Node ② — `classify_and_search`
+### Node ② — `embed_query`
+**Model:** OpenAI embeddings &nbsp;|&nbsp; **Cost tier:** Per query
+
+Embeds the standalone query once. The vector is reused by classification's semantic cache and all selected Qdrant searches; embedding failures are recorded in the graph state.
+
+---
+
+### Node ③ — `classify_and_search`
 **Model:** GPT-4o-mini + Tavily &nbsp;|&nbsp; **Cost tier:** Low (usually cache hit)
 
 Determines **where to look** — which Islamic knowledge collections are relevant — and optionally triggers a live web search for time-sensitive queries.
@@ -169,7 +177,7 @@ Determines **where to look** — which Islamic knowledge collections are relevan
 
 ---
 
-### Node ③ — `parallel_retrieve`
+### Node ④ — `parallel_retrieve`
 **Tool:** Qdrant hybrid search &nbsp;|&nbsp; **Cost tier:** None (self-hosted)
 
 Executes simultaneous semantic searches across all selected Qdrant collections using a `ThreadPoolExecutor(max_workers=8)`.
@@ -181,18 +189,18 @@ Executes simultaneous semantic searches across all selected Qdrant collections u
 
 ---
 
-### Node ④ — `rerank_documents`
+### Node ⑤ — `rerank_documents`
 **Tool:** FlashRank (offline CPU cross-encoder) &nbsp;|&nbsp; **Cost tier:** Zero
 
 Scores every retrieved candidate document against the standalone query using a cross-encoder relevance model and keeps only the highest-quality results.
 
 - **Offline execution:** FlashRank runs a CPU cross-encoder entirely locally — no network latency, no API cost.
-- **Per-source top-K filtering** (`SOURCE_FINAL_LIMITS`): Keeps top 3 Quran verses, top 5 Hadiths, top 2 Tafsir passages, top 6 general knowledge documents.
+- **Per-source top-K filtering** (`SOURCE_FINAL_LIMITS`): Keeps top 3 Quran verses, top 3 Hadiths, top 2 Tafsir passages, top 3 general knowledge documents.
 - **Precision over recall:** Even if 60+ candidates are retrieved, only the most semantically precise documents reach the LLM — preventing hallucination from low-quality context.
 
 ---
 
-### Node ⑤ — `generate_response`
+### Node ⑥ — `generate_response`
 **Model:** GPT-4o flagship &nbsp;|&nbsp; **Cost tier:** Standard
 
 Synthesizes the reranked documents into a grounded, scholarly Islamic answer.
@@ -270,7 +278,7 @@ Each Qdrant collection query combines two complementary retrieval signals:
 - **Sparse vectors (lexical):** BM25 via FastEmbed `Qdrant/bm25` — captures exact keyword and terminology matches (specific Surah names, Hadith collection names, Arabic terms).
 - **Fusion:** Qdrant's native **Reciprocal Rank Fusion (RRF)** merges both ranking signals — documents that score well on both semantic relevance AND lexical match rank highest.
 
-The BM25 model (`Qdrant/bm25`) is loaded once at application startup and shared across all retrieval calls to avoid repeated initialization overhead. Hybrid search is feature-flagged via `HYBRID_SEARCH_ENABLED` and falls back gracefully to dense-only if FastEmbed is unavailable.
+The BM25 model (`Qdrant/bm25`) is loaded once at application startup and shared across all retrieval calls to avoid repeated initialization overhead. Hybrid search is feature-flagged via `HYBRID_SEARCH_ENABLED` and falls back gracefully to dense-only if FastEmbed is unavailable. 
 
 ---
 
@@ -421,6 +429,27 @@ All backend services run as a Docker Compose stack of 5 containers on a single E
 - `qdrant` and `redis` containers have Docker `healthcheck` directives.
 - The `app` container has `depends_on: condition: service_healthy` for both — it only starts after both are confirmed ready.
 
+**Recent application and deployment updates:**
+
+| File | Change |
+|:---|:---|
+| `services/langgraph_service.py`, `schemas/data_classes/langraph_state.py`, `evaluation/pipeline_tracer.py` | Added per-stage latency capture for query rewriting, embedding, classification, retrieval, reranking, and generation. |
+| `evaluation/run_json_evaluation.py`, `evaluation/questions.json` | Added a JSON-driven RAGAS batch evaluator that validates 40 questions and records per-question results in CSV. |
+| `services/prompt_templates.py` | Constrained Quranic Arabic quotations to text present in retrieved context rather than generated from model memory. |
+| `requirements.txt` | Includes the hybrid-search runtime dependencies (Qdrant, FastEmbed, Redis checkpointer, and FlashRank) and uses the `tavily-python` distribution for the `tavily` Python module. |
+| `Dockerfile` | Builds dependencies in a separate stage, installs `libgomp1` for FastEmbed/ONNX Runtime, runs as a non-root user, and creates writable log and LangGraph runtime directories. |
+| `docker-compose.prod.yaml` | Tags the backend image as `islamic-chatbot:latest`; the FastAPI and LangGraph services use that image. Application source is baked into the image rather than mounted from the host, and both services share the named `app_logs` volume. |
+| `.dockerignore` | Excludes the `demo videos/` directory and local-only files from the Docker build context. |
+| `.gitignore` | Excludes local development artifacts, generated evaluation outputs, and `demo videos/` from Git when they are untracked. |
+
+Build and start the production stack with:
+
+```bash
+docker compose -f docker-compose.prod.yaml up -d --build
+```
+
+The app image is built from the repository's `Dockerfile`; the Qdrant and Redis data mounts remain separate from the application image.
+
 ---
 
 ## ⚙️ Concurrency & Scaling Design
@@ -469,7 +498,7 @@ new-advance-islamic-chatbot/
 ├── .env.example                # Environment variable template
 │
 ├── services/
-│   ├── langgraph_service.py    # 5-node LangGraph pipeline, astream, module-level graph export
+│   ├── langgraph_service.py    # LangGraph pipeline, per-stage timings, astream, graph export
 │   ├── openai_service.py       # 3-tier caching engine, LLM calls, embeddings, query rewrite
 │   ├── qdrant_service.py       # Qdrant client, hybrid search (dense + BM25 + RRF), ingestion
 │   ├── rerank_service.py       # FlashRank cross-encoder reranking wrapper
@@ -651,18 +680,18 @@ The `evaluation/` directory contains RAGAS-based evaluation scripts measuring:
 
 - **Faithfulness:** Does the answer stay grounded in the retrieved context?
 - **Answer Relevancy:** How well does the answer address the question?
-- **Context Precision / Recall:** Are the right Islamic documents being retrieved?
+- **Context Precision:** Are the retrieved context chunks useful for the question?
 
-RAGAS v0.2.15 is pinned for compatibility with `langchain-community`. Run evaluations with a HuggingFace `datasets` test set against the `/text_query` endpoint.
+RAGAS v0.2.15 is pinned for compatibility with `langchain-community`. Run an interactive or curated evaluation with `python evaluation/run_evaluation.py`. To evaluate a JSON file containing exactly 40 question strings (either a JSON array or `{"questions": [...]}`), run `python evaluation/run_json_evaluation.py questions.json`; the script appends per-question results to `evaluation/results/json_batch_scores.csv` by default. Pass `--output path.csv` to choose another CSV destination.
 
 ---
 
 ## 🧠 Technical Design Q&A
 
 <details>
-<summary><b>Why a 5-node pipeline instead of a single LLM call?</b></summary>
+<summary><b>Why a staged pipeline instead of a single LLM call?</b></summary>
 
-Each node has a single, testable responsibility. This makes the system inspectable, debuggable, and independently improvable. For example: the reranker can be swapped without touching retrieval; the query rewriter is skipped entirely on first-turn messages at zero cost; and each node's latency is independently traced in LangSmith. A single monolithic LLM call would be impossible to optimize or observe at this granularity.
+Each stage has a single, testable responsibility. This makes the system inspectable, debuggable, and independently improvable. For example: the reranker can be swapped without touching retrieval; the query rewriter is skipped entirely on first-turn messages at zero cost; and rewrite, embedding, classification, retrieval, reranking, and generation durations are recorded in graph state and application logs. A single monolithic LLM call would be impossible to optimize or observe at this granularity.
 
 </details>
 

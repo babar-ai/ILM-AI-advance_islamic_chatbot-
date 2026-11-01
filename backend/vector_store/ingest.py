@@ -198,6 +198,23 @@ SOURCES = {
 # ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Ingest documents into Qdrant collections.")
+    parser.add_argument(
+        "--source",
+        type=str,
+        default="all",
+        choices=list(SOURCES.keys()) + ["all"],
+        help="Specific source to ingest (default: all). E.g. --source general_islamic_info",
+    )
+    parser.add_argument(
+        "--force-recreate",
+        action="store_true",
+        help="Force recreate collection before ingestion.",
+    )
+    args = parser.parse_args()
+
     qdrant_service = QdrantService()
 
     # ── Dense embedding model (OpenAI) ────────────────────────────────
@@ -224,8 +241,11 @@ if __name__ == "__main__":
             bm25_model = None
 
     summary: dict[str, dict] = {}
+    sources_to_process = (
+        {args.source: SOURCES[args.source]} if args.source != "all" else SOURCES
+    )
 
-    for engine_name, source_path in SOURCES.items():
+    for engine_name, source_path in sources_to_process.items():
         collection_name = settings.COLLECTION_NAMES[engine_name]
 
         logger.info("=" * 50)
@@ -246,7 +266,10 @@ if __name__ == "__main__":
             logger.info("%d record(s) kept as 1-to-1 documents (no text splitting needed)", len(chunks))
 
         # ── Create collection (with sparse config if hybrid enabled) ──
-        qdrant_service.setup_collection(collection_name)
+        qdrant_service.setup_collection(
+            collection_name,
+            force_recreate=True if args.force_recreate else None,
+        )
 
         # ── Upload: hybrid (dense + sparse) OR dense-only ─────────────
         if settings.HYBRID_SEARCH_ENABLED and bm25_model is not None:

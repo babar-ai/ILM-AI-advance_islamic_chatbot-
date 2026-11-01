@@ -16,6 +16,13 @@ __pycache__/
 *.pytest_cache/
 *.mypy_cache/
 *.ruff_cache/
+.ipynb_checkpoints/
+
+# Coverage output
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
 
 # ==============================================================================
 # Secrets, Cloud Keys & Environment Variables (CRITICAL)
@@ -130,4 +137,4 @@ flashrank_cache/
 .agents/
 .gemini/
 
-demo videos 
+demo videos/

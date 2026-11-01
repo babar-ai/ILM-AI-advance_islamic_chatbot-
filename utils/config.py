@@ -1,5 +1,7 @@
 
+import os
 from pathlib import Path
+from typing import Any
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -11,12 +13,23 @@ class Settings(BaseSettings):
     # LLM Settings (Dual-Model Strategy)
     # Flagship model: High reasoning, pristine Arabic script, strict citation compliance
     LLM_MODEL: str = "gpt-4o"
+    GROQ_LLM_MODEL: str = "openai/gpt-oss-120b"
+    
     # Fast model: Ultra-fast & low cost for query classification and query rewriting
     FAST_LLM_MODEL: str = "gpt-4o-mini"
+    FAST_GROQ_LLM_MODEL: str = "openai/gpt-oss-20b"
 
+    HF_TOKEN: str = ""
+
+    # Primary LLM Switch (Open / Close):
+    # True  = Primary LLM (OpenAI) is OPEN and used first (falls back to Groq on error).
+    # False = Primary LLM is CLOSED; all requests route directly to Fallback LLM (Groq).
+    USE_PRIMARY_LLM: bool = True
+    USE_PRIMARY_EMBEDDING: bool = True
 
     # Embedding Model Settings
     EMBEDDING_MODEL: str = "text-embedding-3-small"
+    FALLBACK_EMBEDDING_MODEL: str = "Orange/orange-nomic-v1.5-1536"
     EMBEDDING_DIMENSION: int = 1536
 
 
@@ -75,6 +88,7 @@ class Settings(BaseSettings):
     # API Keys (defaults to empty string if not present in environment or .env)
     TAVILY_API_KEY: str = ""
     OPENAI_API_KEY: str = ""
+    GROQ_API_KEY: str = ""
     GEMINI_API_KEY: str = ""
 
 
@@ -91,6 +105,25 @@ class Settings(BaseSettings):
     )
 
     API_BASE_URL: str = "http://localhost:8000"
+
+    def model_post_init(self, __context: Any) -> None:
+        for alt in ("USE_MAIN_LLM", "MAIN_LLM_OPEN", "ENABLE_PRIMARY_LLM", "USE_OPENAI_LLM"):
+            if alt in os.environ:
+                self.USE_PRIMARY_LLM = os.environ[alt].strip().lower() in ("true", "1", "yes", "on")
+                break
+        for alt in ("USE_MAIN_EMBEDDING", "MAIN_EMBEDDING_OPEN", "ENABLE_PRIMARY_EMBEDDING", "USE_OPENAI_EMBEDDING"):
+            if alt in os.environ:
+                self.USE_PRIMARY_EMBEDDING = os.environ[alt].strip().lower() in ("true", "1", "yes", "on")
+                break
+
+        if self.HF_TOKEN:
+            os.environ["HF_TOKEN"] = self.HF_TOKEN
+            os.environ["HUGGING_FACE_HUB_TOKEN"] = self.HF_TOKEN
+            try:
+                from huggingface_hub import login
+                login(token=self.HF_TOKEN, add_to_git_credential=False)
+            except Exception:
+                pass
 
     @property
     def COLLECTION_NAMES(self) -> dict[str, str]:

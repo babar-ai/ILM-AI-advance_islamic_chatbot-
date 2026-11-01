@@ -12,17 +12,26 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# fastembed/ONNX Runtime require the OpenMP runtime on slim Debian images.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy pre-built Python packages from builder stage
 COPY --from=builder /install /usr/local
 
 # Copy application source code
 COPY . .
 
-# Create logs directory
-RUN mkdir -p /app/logs
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# Create writable runtime directories for the non-root application user.
+RUN mkdir -p /app/logs /app/.langgraph_api \
+    && adduser --disabled-password --no-create-home --gecos "" appuser \
+    && chown -R appuser:appuser /app/logs /app/.langgraph_api
 
 # Don't run as root in production
-RUN adduser --disabled-password --no-create-home appuser
 USER appuser
 
 EXPOSE 8000

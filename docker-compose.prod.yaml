@@ -18,6 +18,7 @@ services:
   # ── FastAPI Backend ────────────────────────────────────────────────
   app:
     build: .
+    image: islamic-chatbot:latest
     container_name: islamic-chatbot-api
     restart: unless-stopped
     expose:
@@ -29,12 +30,7 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
     volumes:
-      - ./logs:/app/logs
-      - ./services:/app/services:ro
-      - ./schemas:/app/schemas:ro
-      - ./utils:/app/utils:ro
-      - ./backend:/app/backend
-      - ./application.py:/app/application.py:ro
+      - app_logs:/app/logs
     depends_on:
       qdrant:
         condition: service_healthy
@@ -79,7 +75,7 @@ services:
   # installed via requirements.txt). Overrides CMD to run `langgraph dev` which
   # exposes the graph over HTTP on port 8123 for LangSmith Studio to connect to.
   langgraph-api:
-    build: .
+    image: islamic-chatbot:latest
     container_name: langgraph-api
     restart: unless-stopped
     command: >
@@ -95,7 +91,7 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
     volumes:
-      - .:/app
+      - app_logs:/app/logs
     depends_on:
       qdrant:
         condition: service_healthy
@@ -105,3 +101,4 @@ services:
 volumes:
   caddy_data:
   caddy_config:
+  app_logs:

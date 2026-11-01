@@ -1,7 +1,9 @@
 
 import asyncio
 import contextvars
+import inspect
 import re
+import time
 from typing import Optional, List, Dict, Any
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,7 +18,7 @@ from services.qdrant_service import QdrantService
 from services.openai_service import OpenAIService
 from utils.config import settings
 from utils.custom_logger import setup_logger
-
+from fastembed.sparse.bm25 import Bm25
 from langsmith import traceable
 
 from services import rerank_service
@@ -38,10 +40,46 @@ SOURCE_RETRIEVE_LIMITS = {
 # When reranking is disabled these are used directly as retrieval limits.
 SOURCE_FINAL_LIMITS = {
     "quran": 3,
-    "hadith": 5,
+    "hadith": 3,
     "tafseer": 2,
-    "general_islamic_info": 6,
+    "general_islamic_info": 3,
 }
+
+
+def _timed_node(stage: str, node: Any) -> Any:
+    """Measure a graph node, log its wall time, and add it to graph state."""
+    if inspect.iscoroutinefunction(node):
+        async def timed_async(state: LangGraphState) -> dict:
+            started = time.perf_counter()
+            try:
+                result = await node(state)
+            finally:
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                logger.info("Pipeline stage timing | stage=%s duration_ms=%.2f", stage, elapsed_ms)
+
+            update = dict(result)
+            timings = dict(state.get("stage_timings_ms") or {})
+            timings[stage] = round(elapsed_ms, 2)
+            update["stage_timings_ms"] = timings
+            return update
+
+        return timed_async
+
+    def timed_sync(state: LangGraphState) -> dict:
+        started = time.perf_counter()
+        try:
+            result = node(state)
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            logger.info("Pipeline stage timing | stage=%s duration_ms=%.2f", stage, elapsed_ms)
+
+        update = dict(result)
+        timings = dict(state.get("stage_timings_ms") or {})
+        timings[stage] = round(elapsed_ms, 2)
+        update["stage_timings_ms"] = timings
+        return update
+
+    return timed_sync
 
 
 def _extract_source_url(meta: dict) -> Optional[str]:
@@ -87,8 +125,9 @@ def _remove_sources_section(text: str) -> str:
 
 class LangGraphService:
     """
-    5-node LangGraph pipeline with persistent chat history via Redis checkpointer:
-        rewrite_query → classify_and_search → parallel_retrieve → rerank_documents → generate_response
+    6-stage LangGraph pipeline with persistent chat history via Redis checkpointer:
+        rewrite_query → embed_query → classify_and_search → parallel_retrieve
+                      → rerank_documents → generate_response
     """
 
     def __init__(
@@ -127,7 +166,6 @@ class LangGraphService:
         if settings.HYBRID_SEARCH_ENABLED:
 
             try:
-                from fastembed.sparse.bm25 import Bm25
                 self._bm25_model = Bm25(model_name="Qdrant/bm25", language="english")
                 logger.info("BM25 sparse encoder (fastembed) loaded for hybrid search.")
 
@@ -196,33 +234,62 @@ class LangGraphService:
 
 
     # ─────────────────────────────────────────────────────────
-    # Node 1: Classify user query + web search (concurrent)
+    # Node 1: Embed the standalone query
+    # ─────────────────────────────────────────────────────────
+
+    def _embed_query(self, state: LangGraphState) -> dict:
+        query = state.get("standalone_query") or state.get("user_query", "")
+        try:
+            return {"query_embedding": self.openai_service.embed_query(query)}
+        except Exception as exc:
+            logger.error("Error embedding standalone query: %s", exc)
+            return {"query_embedding": None, "error_message": str(exc)}
+
+
+    # ─────────────────────────────────────────────────────────
+    # Node 2: Classify user query + web search (concurrent)
     # ─────────────────────────────────────────────────────────
 
     def _classify_and_search(self, state: LangGraphState) -> dict:
         """
-        Node 1: Embeds standalone_query once, then runs web search and
-        LLM classification concurrently via ThreadPoolExecutor.
+        Classifies the query and runs web search concurrently via ThreadPoolExecutor.
 
         Uses standalone_query (not raw user_query) so that follow-up questions
-        that were rewritten in Node 0 produce a meaningful embedding vector and
-        classification result.
+        that were rewritten in Node 0 produce a meaningful classification result.
         """
+        query_to_use = state.get("standalone_query") or state.get("user_query", "")
+        query_embedding = state.get("query_embedding")
+        if not query_embedding:
+            return {
+                "web_search_results": [],
+                "required_sources": ["general_islamic_info"],
+                "classification_reasoning": "",
+                "filters": None,
+                "error_message": state.get("error_message") or "Query embedding missing",
+            }
+
+        classification_timing: Dict[str, float] = {}
+
+        def classify_with_timing() -> dict:
+            started = time.perf_counter()
+            try:
+                return self.openai_service.classify_query(query_to_use, query_embedding)
+            finally:
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                classification_timing["classify"] = round(elapsed_ms, 2)
+                logger.info(
+                    "Pipeline stage timing | stage=classify duration_ms=%.2f",
+                    elapsed_ms,
+                )
+
         try:
-            # Use the rewritten standalone query for embedding + classification
-            query_to_use = state.get("standalone_query") or state.get("user_query", "")
-
-            # Step 1: Embed once — vector reused for classification cache + all retrievals
-            logger.info("Embedding standalone_query...")
-            query_embedding = self.openai_service.embed_query(query_to_use)
-
-            # Step 2: Web search and classification concurrently (propagating tracing context)
+            # Web search and classification run concurrently (propagating tracing context).
             # Each concurrent task must have its own context copy; sharing a single Context across
             # threads causes "cannot enter context: is already entered".
             ctx_web = contextvars.copy_context()
             ctx_classify = contextvars.copy_context()
             web_future = self.classification_executor.submit(ctx_web.run, self._run_web_search, query_to_use)
-            classify_future = self.classification_executor.submit(ctx_classify.run, self.openai_service.classify_query, query_to_use, query_embedding)
+            classify_future = self.classification_executor.submit(ctx_classify.run, classify_with_timing)
 
             # Collect web search results
             web_search_results = web_future.result()
@@ -254,12 +321,19 @@ class LangGraphService:
                 "required_sources": required_sources,
                 "classification_reasoning": classification_reasoning,
                 "filters": filters,
+                "stage_timings_ms": {
+                    **(state.get("stage_timings_ms") or {}),
+                    **classification_timing,
+                },
             }
 
         except Exception as e:
             logger.error(f"Error in _classify_and_search: {e}")
             return {
-                "query_embedding": locals().get("query_embedding"),
+                "stage_timings_ms": {
+                    **(state.get("stage_timings_ms") or {}),
+                    **classification_timing,
+                },
                 "required_sources": ["general_islamic_info"],
                 "error_message": str(e),
             }
@@ -284,6 +358,7 @@ class LangGraphService:
         Falls back to dense-only search if hybrid fails or is disabled.
         """
         query_embedding = state.get("query_embedding")
+
         if not query_embedding:
             logger.error("No query embedding available for retrieval")
             return {"error_message": "Query embedding missing"}
@@ -467,7 +542,7 @@ class LangGraphService:
             for i, doc in enumerate(web_search_results):
                 title = doc.get("title", "Web Source")
                 url = doc.get("url", "").strip()
-                content = doc.get("content", "")
+                content = (doc.get("content", "") or "")[:800]
                 web_context += (
                     f"{i+1}.\n"
                     f"Title: {title}\n"
@@ -588,7 +663,13 @@ class LangGraphService:
 
             context_sections.append(source_context)
 
-        return "\n\n".join(context_sections)
+        full_context = "\n\n".join(context_sections)
+        # Enforce budget to ensure total tokens fit within LLM rate limits (e.g. Groq 8000 TPM)
+        MAX_TOTAL_CONTEXT_CHARS = 12000
+        if len(full_context) > MAX_TOTAL_CONTEXT_CHARS:
+            full_context = full_context[:MAX_TOTAL_CONTEXT_CHARS] + "\n\n[Additional context truncated for token limits]"
+
+        return full_context
 
 
     # ─────────────────────────────────────────────────────────
@@ -684,17 +765,17 @@ class LangGraphService:
 
             search_results = self.tavily_client.search(
                 query=f"{query} in Islam.",
-                search_depth="advanced",
-                max_results=1,
-                include_answer=True,
-                include_raw_content=True,
-                timeout=30,
+                search_depth="basic",
+                max_results=2,
+                include_answer=False,
+                include_raw_content=False,
+                timeout=15,
             )
 
             web_documents = []
             for result in search_results.get("results", []):
                 web_documents.append({
-                    "content": result.get("content", ""),
+                    "content": (result.get("content", "") or "")[:800],
                     "url": result.get("url", ""),
                     "title": result.get("title", ""),
                 })
@@ -712,10 +793,10 @@ class LangGraphService:
     # ─────────────────────────────────────────────────────────
     async def setup_graph(self):
         """
-        Build and compile the 5-node LangGraph pipeline with the Redis checkpointer.
+        Build and compile the LangGraph pipeline with the Redis checkpointer.
 
         Pipeline:
-            rewrite_query → classify_and_search → parallel_retrieve
+            rewrite_query → embed_query → classify_and_search → parallel_retrieve
                           → rerank_documents → generate_response → END
 
         Why async?
@@ -736,15 +817,17 @@ class LangGraphService:
         workflow = StateGraph(LangGraphState)
 
         # ── Register nodes ────────────────────────────────────────────
-        workflow.add_node("rewrite_query",      self._rewrite_query)
+        workflow.add_node("rewrite_query",      _timed_node("rewrite", self._rewrite_query))
+        workflow.add_node("embed_query",         _timed_node("embed", self._embed_query))
         workflow.add_node("classify_and_search", self._classify_and_search)
-        workflow.add_node("parallel_retrieve",   self._parallel_retrieve)
-        workflow.add_node("rerank_documents",    self._rerank_documents)
-        workflow.add_node("generate_response",   self._generate_response)
+        workflow.add_node("parallel_retrieve",   _timed_node("retrieve", self._parallel_retrieve))
+        workflow.add_node("rerank_documents",    _timed_node("rerank", self._rerank_documents))
+        workflow.add_node("generate_response",   _timed_node("generate", self._generate_response))
 
         # ── Wire edges (linear flow) ──────────────────────────────────
         workflow.set_entry_point("rewrite_query")
-        workflow.add_edge("rewrite_query",      "classify_and_search")
+        workflow.add_edge("rewrite_query",      "embed_query")
+        workflow.add_edge("embed_query",         "classify_and_search")
         workflow.add_edge("classify_and_search", "parallel_retrieve")
         workflow.add_edge("parallel_retrieve",   "rerank_documents")
         workflow.add_edge("rerank_documents",    "generate_response")
@@ -800,6 +883,7 @@ class LangGraphService:
                 "user_query": user_query,
                 "standalone_query": user_query,  # Node 0 will overwrite if history exists
                 "query_embedding": None,
+                "stage_timings_ms": {},
                 "web_search_results": [],
                 "required_sources": [],
                 "classification_reasoning": "",
@@ -846,7 +930,8 @@ class LangGraphService:
         """
         Async generator that yields SSE event dicts using LangGraph's native astream().
         Executes the full compiled StateGraph:
-            rewrite_query → classify_and_search → parallel_retrieve → rerank_documents → generate_response → END
+            rewrite_query → embed_query → classify_and_search → parallel_retrieve
+                          → rerank_documents → generate_response → END
 
         session_id is passed as thread_id in the LangGraph config so the checkpointer
         loads/saves the correct conversation history for this user session.
@@ -864,6 +949,7 @@ class LangGraphService:
                 "user_query": user_query,
                 "standalone_query": user_query,
                 "query_embedding": None,
+                "stage_timings_ms": {},
                 "web_search_results": [],
                 "required_sources": [],
                 "classification_reasoning": "",
@@ -927,14 +1013,16 @@ def _build_graph_for_studio() -> object:
     _svc = LangGraphService.__new__(LangGraphService)
 
     _wf = StateGraph(LangGraphState)
-    _wf.add_node("rewrite_query",       _svc._rewrite_query)
+    _wf.add_node("rewrite_query",       _timed_node("rewrite", _svc._rewrite_query))
+    _wf.add_node("embed_query",         _timed_node("embed", _svc._embed_query))
     _wf.add_node("classify_and_search", _svc._classify_and_search)
-    _wf.add_node("parallel_retrieve",   _svc._parallel_retrieve)
-    _wf.add_node("rerank_documents",    _svc._rerank_documents)
-    _wf.add_node("generate_response",   _svc._generate_response)
+    _wf.add_node("parallel_retrieve",   _timed_node("retrieve", _svc._parallel_retrieve))
+    _wf.add_node("rerank_documents",    _timed_node("rerank", _svc._rerank_documents))
+    _wf.add_node("generate_response",   _timed_node("generate", _svc._generate_response))
 
     _wf.set_entry_point("rewrite_query")
-    _wf.add_edge("rewrite_query",       "classify_and_search")
+    _wf.add_edge("rewrite_query",       "embed_query")
+    _wf.add_edge("embed_query",          "classify_and_search")
     _wf.add_edge("classify_and_search", "parallel_retrieve")
     _wf.add_edge("parallel_retrieve",   "rerank_documents")
     _wf.add_edge("rerank_documents",    "generate_response")

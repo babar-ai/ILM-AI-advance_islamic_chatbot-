@@ -51,6 +51,7 @@ flashrank_cache/
 .gemini/
 
 # Demo / docs
+demo videos/
 demo_app.py
 linkedin_demo_script.md
 workflows/

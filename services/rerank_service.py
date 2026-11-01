@@ -25,8 +25,11 @@ def _get_ranker():
         return _ranker
 
     try:
+        import tempfile
+        from pathlib import Path
         from flashrank import Ranker
-        _ranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir="/tmp/flashrank_cache")
+        cache_path = str(Path(tempfile.gettempdir()) / "flashrank_cache")
+        _ranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir=cache_path)
         logger.info("FlashRank reranker loaded (ms-marco-MiniLM-L-12-v2).")
 
     except ImportError:
@@ -84,14 +87,18 @@ def rerank(
         ]
 
         rerank_request = RerankRequest(query=query, passages=passages)
-        results = ranker.rerank(rerank_request)
+        results = ranker.rerank(rerank_request) 
 
         # Filter by score threshold, then keep top_n
-        filtered = [r for r in results if r.get("score", 0.0) >= score_threshold]
+        filtered = [r for r in results if r.get("score", 0.0) >= score_threshold] 
         top_results = filtered[:top_n]
-
-        # Map back to original document dicts preserving all metadata
-        reranked_docs = [documents[r["id"]] for r in top_results]
+     
+        # Map back to original document dicts preserving all metadata and attaching rerank score
+        reranked_docs = []
+        for r in top_results:
+            doc = dict(documents[r["id"]])
+            doc["rerank_score"] = float(r.get("score", 0.0))
+            reranked_docs.append(doc) 
 
         logger.debug(
             "Reranked %d → %d docs (threshold=%.2f, top_n=%d)",

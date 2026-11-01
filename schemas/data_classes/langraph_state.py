@@ -16,12 +16,14 @@ from typing import List, Optional, Dict, Any, Annotated
 #   - We simply concatenate them so history grows across turns automatically. 
 #   - If "update" is None or empty we leave history unchanged (safe default).
 # ─────────────────────────────────────────────────────────────────────────────
+
 def _append_chat_history(current: List[Dict], update: List[Dict]) -> List[Dict]:
     
     if not update:
         return current or []
 
     return (current or []) + update
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LangGraph State  (TypedDict — required for Annotated reducers to work)
@@ -44,6 +46,7 @@ def _append_chat_history(current: List[Dict], update: List[Dict]) -> List[Dict]:
 #   final_response    – LLM answer for this turn (replaced each turn).
 #   error_message     – set if any node raises an exception.
 #   filters           – optional metadata filters from classifier.
+#   stage_timings_ms  – per-request wall-clock duration for each pipeline stage.
 #   chat_history      – PERSISTENT across turns via _append_chat_history reducer.
 #                       Each element: {"role": "user"|"assistant", "content": "..."}
 # ─────────────────────────────────────────────────────────────────────────────
@@ -64,6 +67,7 @@ class LangGraphState(dict):
     final_response: str
     error_message: Optional[str]
     filters: Optional[Dict[str, Any]]
+    stage_timings_ms: Dict[str, float]
 
     # Persistent field — grows across turns (checkpointer restores + reducer appends)
     chat_history: Annotated[List[Dict], _append_chat_history]

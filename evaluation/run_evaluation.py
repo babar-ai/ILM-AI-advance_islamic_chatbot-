@@ -181,11 +181,34 @@ def print_summary(results: list[dict]) -> None:
     print("=" * 60)
 
 
+BENCHMARK_QUESTIONS = [
+    "what are the five pillars of islam?",
+    "what is zakat? and why it is compuslory for muslims to pay?",
+    "What does Surah Al-Baqarah verse 153 say about patience and prayer?",
+    "What does Sahih al-Bukhari say about intentions and deeds?",
+]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Main — interactive loop
+# Main — interactive loop & CLI runner
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Islamic Chatbot — RAGAS Evaluation Runner")
+    parser.add_argument(
+        "--question",
+        type=str,
+        default=None,
+        help="Evaluate a single question directly without interactive prompts.",
+    )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Run a standard multi-source benchmark covering Quran, Hadith, Tafsir, and General Islamic Info.",
+    )
+    args = parser.parse_args()
+
     print("\n" + "=" * 60)
     print("  🕌  Islamic Chatbot — RAGAS Evaluation")
     print(f"  LangSmith: {'✅ Enabled' if settings.langsmith_enabled else '❌ Disabled (add LANGCHAIN_API_KEY to .env)'}")
@@ -195,10 +218,31 @@ def main():
     service = TracingLangGraphService()
     print("✅  Pipeline ready.\n")
 
+    results = []
+
+    # Mode 1: Single question passed via CLI
+    if args.question:
+        result = evaluate_question(service, args.question.strip())
+        results.append(result)
+        save_to_csv(result)
+        print_summary(results)
+        return
+
+    # Mode 2: Multi-source benchmark
+    if args.benchmark:
+        print(f"🚀  Running benchmark with {len(BENCHMARK_QUESTIONS)} curated questions...\n")
+        for idx, q in enumerate(BENCHMARK_QUESTIONS, 1):
+            print(f"\n[{idx}/{len(BENCHMARK_QUESTIONS)}] Benchmark Question: {q}")
+            result = evaluate_question(service, q)
+            results.append(result)
+            save_to_csv(result)
+        print_summary(results)
+        return
+
+    # Mode 3: Interactive prompt
     print("💬  Type your question and press Enter to evaluate.")
     print("    Type 'quit' or press Ctrl+C to exit.\n")
 
-    results = []
     while True:
         try:
             question = input("❓  Your question: ").strip()

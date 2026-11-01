@@ -4,6 +4,8 @@ import numpy as np
 from typing import Any, Optional, List
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from cachetools import TTLCache
 import redis
@@ -23,24 +25,39 @@ class OpenAIService:
 
     def __init__(self, qdrant_service: Optional[QdrantService] = None):
 
-        # Flagship LLM: Used for final response generation & streaming (gpt-4o)
+        # Flagship LLM: Used for final response generation & streaming (gpt-4o) with Groq fallback
         self.llm = ChatOpenAI(
             model=settings.LLM_MODEL,
             api_key=settings.OPENAI_API_KEY,
             timeout=45,
             max_retries=2,
         )
-        # Fast LLM: Used for classification, query rewrite, and structured extraction (gpt-4o-mini)
+        self.fallback_llm = ChatGroq(
+            model=settings.GROQ_LLM_MODEL,
+            api_key=settings.GROQ_API_KEY,
+            timeout=45,
+            max_retries=2,
+        ) if settings.GROQ_API_KEY else None
+
+        # Fast LLM: Used for classification, query rewrite, and structured extraction (gpt-4o-mini) with Groq fallback
         self.fast_llm = ChatOpenAI(
             model=settings.FAST_LLM_MODEL,
             api_key=settings.OPENAI_API_KEY,
             timeout=20,
             max_retries=2,
         )
+        self.fast_fallback_llm = ChatGroq(
+            model=settings.FAST_GROQ_LLM_MODEL,
+            api_key=settings.GROQ_API_KEY,
+            timeout=20,
+            max_retries=2,
+        ) if settings.GROQ_API_KEY else None
+
         self.embeddings = OpenAIEmbeddings(
             model=settings.EMBEDDING_MODEL,
             openai_api_key=settings.OPENAI_API_KEY
         )
+        self.fallback_embeddings = None
  
         # In-memory fallback caches
         self._classification_cache = TTLCache(maxsize=500, ttl=3600)  
@@ -268,11 +285,45 @@ class OpenAIService:
         return {"status": "error", "message": result["message"]}
 
 
+    def _get_or_init_fallback_embeddings(self) -> HuggingFaceEmbeddings:
+        """Lazily initialise the HuggingFace fallback embedding model."""
+        if not self.fallback_embeddings:
+            hf_kwargs = {"trust_remote_code": True}
+            if settings.HF_TOKEN:
+                hf_kwargs["token"] = settings.HF_TOKEN
+            self.fallback_embeddings = HuggingFaceEmbeddings(
+                model_name=settings.FALLBACK_EMBEDDING_MODEL,
+                model_kwargs=hf_kwargs,
+                encode_kwargs={"normalize_embeddings": True}
+            )
+            logger.info("HuggingFace fallback embeddings initialised (%s).", settings.FALLBACK_EMBEDDING_MODEL)
+        return self.fallback_embeddings
+
     def embed_query(self, query: str) -> List[float]:
-        """Embed a query string into a vector. Called once per request."""
-        return self.embeddings.embed_query(query)
+        """Embed a query string.
 
+        Routing is controlled by settings.USE_PRIMARY_EMBEDDING:
+          True  → try OpenAI first; fall back to HuggingFace on error.
+          False → go directly to HuggingFace (OpenAI is skipped entirely).
+        """
+        if not settings.USE_PRIMARY_EMBEDDING:
+            logger.info("Primary embedding is DISABLED — using HuggingFace (%s) directly.", settings.FALLBACK_EMBEDDING_MODEL)
+            return self._get_or_init_fallback_embeddings().embed_query(query)
 
+        try:
+            return self.embeddings.embed_query(query)
+        except Exception as e:
+            logger.warning(
+                "Primary OpenAI embedding failed (%s). Falling back to HuggingFace (%s)...",
+                e, settings.FALLBACK_EMBEDDING_MODEL
+            )
+            try:
+                return self._get_or_init_fallback_embeddings().embed_query(query)
+            except Exception as fallback_err:
+                logger.error("Fallback embedding also failed: %s", fallback_err)
+                raise fallback_err
+ 
+ 
     def rewrite_query(self, user_query: str, chat_history: List[dict]) -> str:
         """
         Rewrites a potentially ambiguous follow-up question into a fully
@@ -318,8 +369,17 @@ class OpenAIService:
                 HumanMessage(content=task_input),
             ]
 
-            # Use fast structured LLM for ultra-fast query reformulations
-            structured_llm = self.fast_llm.with_structured_output(QueryRewriteSchema)
+            # Use fast structured LLM for ultra-fast query reformulations.
+            # Routing: if USE_PRIMARY_LLM is False skip OpenAI and go straight to Groq.
+            if settings.USE_PRIMARY_LLM:
+                structured_llm = self.fast_llm.with_structured_output(QueryRewriteSchema)
+            else:
+                if self.fast_fallback_llm is None:
+                    logger.warning("USE_PRIMARY_LLM=False but no fallback LLM available — using primary.")
+                    structured_llm = self.fast_llm.with_structured_output(QueryRewriteSchema)
+                else:
+                    logger.info("USE_PRIMARY_LLM=False — routing rewrite_query to Groq (%s).", settings.FAST_GROQ_LLM_MODEL)
+                    structured_llm = self.fast_fallback_llm.with_structured_output(QueryRewriteSchema)
             res = structured_llm.invoke(messages)
 
             rewritten = ""
@@ -399,7 +459,30 @@ class OpenAIService:
             # Current user question is always the final message
             messages.append(HumanMessage(content=query))
 
-            response = await self.llm.ainvoke(messages)
+            def _trim_for_groq(msgs: list) -> list:
+                """Truncate the system message to stay within Groq TPM limits."""
+                out = list(msgs)
+                if out and len(out[0].content) > 12000:
+                    out[0] = SystemMessage(content=out[0].content[:12000] + "\n\n[Context truncated for Groq TPM limit]")
+                return out
+
+            if not settings.USE_PRIMARY_LLM:
+                # Primary LLM closed → route directly to Groq, no OpenAI attempt
+                if self.fallback_llm:
+                    logger.info("USE_PRIMARY_LLM=False — routing agenerate_response to Groq (%s).", settings.GROQ_LLM_MODEL)
+                    response = await self.fallback_llm.ainvoke(_trim_for_groq(messages))
+                else:
+                    raise RuntimeError("USE_PRIMARY_LLM=False but no fallback_llm configured.")
+            else:
+                try:
+                    response = await self.llm.ainvoke(messages)
+                except Exception as openai_err:
+                    if self.fallback_llm:
+                        logger.warning("OpenAI ainvoke failed (%s). Falling back to Groq (%s)...", openai_err, settings.GROQ_LLM_MODEL)
+                        response = await self.fallback_llm.ainvoke(_trim_for_groq(messages))
+                    else:
+                        raise openai_err
+
             return {
                 "status": "success",
                 "message": response.content,
@@ -412,7 +495,7 @@ class OpenAIService:
     async def generate_response_stream(self, query: str, context: str):
         """
         Async generator that streams the LLM response token-by-token.
-        Uses ChatOpenAI.astream() which yields AIMessageChunk objects.
+        Uses ChatOpenAI.astream() (with Groq fallback) which yields AIMessageChunk objects.
         Each yielded value is a string token fragment.
         """
         prompt = ENGLISH_RESPONSE_PROMPT.replace("{context}", context)
@@ -420,27 +503,82 @@ class OpenAIService:
             SystemMessage(content=prompt),
             HumanMessage(content=query),
         ]
+
+        def _trim(msgs: list) -> list:
+            out = list(msgs)
+            if out and len(out[0].content) > 12000:
+                out[0] = SystemMessage(content=out[0].content[:12000] + "\n\n[Context truncated for Groq TPM limit]")
+            return out
+
         try:
-            async for chunk in self.llm.astream(messages):
-                if chunk.content:
-                    yield chunk.content
+            if not settings.USE_PRIMARY_LLM:
+                # Primary LLM closed → stream directly from Groq
+                if self.fallback_llm:
+                    logger.info("USE_PRIMARY_LLM=False — streaming via Groq (%s).", settings.GROQ_LLM_MODEL)
+                    async for chunk in self.fallback_llm.astream(_trim(messages)):
+                        if chunk.content:
+                            yield chunk.content
+                else:
+                    raise RuntimeError("USE_PRIMARY_LLM=False but no fallback_llm configured.")
+            else:
+                try:
+                    async for chunk in self.llm.astream(messages):
+                        if chunk.content:
+                            yield chunk.content
+                except Exception as openai_err:
+                    if self.fallback_llm:
+                        logger.warning("OpenAI astream failed (%s). Falling back to Groq stream...", openai_err)
+                        async for chunk in self.fallback_llm.astream(_trim(messages)):
+                            if chunk.content:
+                                yield chunk.content
+                    else:
+                        raise openai_err
         except Exception as e:
             logger.error(f"Error in generate_response_stream: {e}")
             yield f"\n\n[Error: {str(e)}]"
 
 
     def _process_request(self, prompt: str, text: str, schema=None, use_fast_llm: bool = False) -> dict:
-        """Generic method to handle requests to OpenAI via LangChain."""
+        """Generic LLM call with primary / fallback routing.
+
+        Routing (controlled by settings.USE_PRIMARY_LLM):
+          True  → try primary (OpenAI) first; on error fall back to Groq.
+          False → skip OpenAI entirely and call Groq directly.
+        """
         try:
             messages = [
                 SystemMessage(content=prompt),
                 HumanMessage(content=text)
             ]
 
-            # Dual-model routing: use fast_llm for structured schema tasks (classification), flagship llm for generation
-            target_llm = self.fast_llm if (schema or use_fast_llm) else self.llm
-            llm_instance = target_llm.with_structured_output(schema) if schema else target_llm
-            response = llm_instance.invoke(messages)
+            # Select the right model pair based on task type
+            primary_llm   = self.fast_llm         if (schema or use_fast_llm) else self.llm
+            fallback_model = self.fast_fallback_llm if (schema or use_fast_llm) else self.fallback_llm
+            model_label    = "fast" if (schema or use_fast_llm) else "flagship"
+
+            if not settings.USE_PRIMARY_LLM:
+                # Primary LLM is CLOSED → go straight to Groq
+                if fallback_model:
+                    logger.info(
+                        "USE_PRIMARY_LLM=False — routing _process_request (%s) directly to Groq.", model_label
+                    )
+                    fallback_instance = fallback_model.with_structured_output(schema) if schema else fallback_model
+                    response = fallback_instance.invoke(messages)
+                else:
+                    raise RuntimeError(
+                        f"USE_PRIMARY_LLM=False but no fallback model available for '{model_label}' requests."
+                    )
+            else:
+                try:
+                    llm_instance = primary_llm.with_structured_output(schema) if schema else primary_llm
+                    response = llm_instance.invoke(messages)
+                except Exception as primary_err:
+                    if fallback_model:
+                        logger.warning("Primary LLM request failed (%s). Falling back to Groq...", primary_err)
+                        fallback_instance = fallback_model.with_structured_output(schema) if schema else fallback_model
+                        response = fallback_instance.invoke(messages)
+                    else:
+                        raise primary_err
 
             return {
                 "status": "success",
